@@ -149,7 +149,7 @@ def _is_libs_cu13_install_intact() -> bool:
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "flashqla", "cutedsl"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -164,6 +164,11 @@ def _resolve_gdn_prefill_backend(
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
     * Blackwell (SM10.x) with ``head_k_dim == 128``;
+
+    FlashQLA TileLang GDN prefill kernel is chosen when:
+    * "flashqla" is requested; (opt-in only, not auto-selected)
+    * Blackwell device family (SM10.x);
+    * ``flash_qla`` module is importable.
     """
     additional_config = vllm_config.additional_config
     backend_cfg = (
@@ -208,7 +213,36 @@ def _resolve_gdn_prefill_backend(
         return backend, "flashinfer"
     if backend == "cutedsl" and supports_cutedsl:
         return backend, "cutedsl"
+    if backend == "flashqla" and supports_flashqla_gdn_prefill(backend):
+        return backend, "flashqla"
     return backend, "triton"
+
+
+@functools.cache
+def supports_flashqla_gdn_prefill(backend: str) -> bool:
+    """Whether to use FlashQLA's TileLang GDN prefill kernel.
+
+    Requirements:
+    * ``requested == "flashqla"`` (opt-in only, not auto-selected);
+    * ``platform == cuda``;
+    * Blackwell device family (SM10.x / compute_major >= 10);
+    * ``flash_qla`` module is importable.
+
+    Unlike FlashInfer Blackwell, FlashQLA has no head_k_dim or
+    cutlass-dsl constraints.
+    """
+    if backend != "flashqla":
+        return False
+    if not current_platform.is_cuda():
+        return False
+    if not current_platform.is_device_capability_family(100):
+        return False  # Not Blackwell.
+    try:
+        import importlib
+        importlib.import_module("flash_qla")
+    except (ImportError, ModuleNotFoundError):
+        return False
+    return True
 
 
 def _log_gdn_backend_decision(
@@ -222,6 +256,7 @@ def _log_gdn_backend_decision(
     )
     chosen = {
         "flashinfer": "FlashInfer",
+        "flashqla": "FlashQLA (TileLang)",
         "cutedsl": "CuteDSL",
         "triton": "Triton/FLA",
     }[active_backend]
@@ -287,6 +322,44 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
+def _flashqla_chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+):
+    """FlashQLA TileLang GDN forward — faster than FLA Triton on Blackwell
+    consumer (sm_120/121).  Imported lazily so that the import error (if
+    flash_qla isn't installed) doesn't kill vLLM startup."""
+    from flash_qla import chunk_gated_delta_rule as _fqla_kernel
+
+    # vLLM's GDN state is laid out as (B, H, V, K) — see
+    # MambaStateShapeCalculator.gated_delta_net_state_shape — but
+    # FlashQLA's chunk_gated_delta_rule_fwd allocates (B, H, K, V).
+    # Transpose the last two dims on the way in and on the way out.
+    if initial_state is not None:
+        initial_state = initial_state.transpose(-1, -2).contiguous()
+    o, final_state = _fqla_kernel(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    if final_state is not None:
+        final_state = final_state.transpose(-1, -2).contiguous()
+    return o, final_state
+
+
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
@@ -295,7 +368,7 @@ class ChunkGatedDeltaRule(CustomOp):
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
 
-        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+        if backend in ("flashinfer", "cutedsl", "flashqla") and active_backend != backend:
             logger.warning_once(
                 "GDN prefill backend '%s' is selected but cannot use this "
                 "kernel on the current platform. Falling back to Triton/FLA.",
@@ -303,12 +376,46 @@ class ChunkGatedDeltaRule(CustomOp):
             )
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
 
-        if active_backend == "flashinfer":
+        if active_backend == "flashqla":
+            self._forward_method = self.forward_flashqla
+        elif active_backend == "flashinfer":
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
         else:
             self._forward_method = self.forward_native
+
+    def forward_flashqla(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        o, final_state = _flashqla_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if core_attn_out is not None:
+            o_flat = o.squeeze(0).reshape(-1)
+            co_flat = core_attn_out.reshape(-1)
+            co_flat[: o_flat.numel()].copy_(o_flat)
+        return o, final_state
 
     def forward_cuda(
         self,
