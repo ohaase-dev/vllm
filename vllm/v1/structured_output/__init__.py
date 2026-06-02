@@ -274,13 +274,8 @@ class StructuredOutputManager:
 
                 state_advancements = 0
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
-                if self.vllm_config.model_config.is_diffusion and req_tokens:
-                    # Diffusion LLMs don't sample a bonus token after the
-                    # scheduled positions, so don't append the -1 placeholder.
-                    token_iter: Iterable[int] = req_tokens
-                else:
-                    token_iter = itertools.chain(req_tokens, (-1,))
-                for token in token_iter:
+                # Phase 1: scheduled spec-draft positions.
+                for token in req_tokens:
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
                     if token == -1:
                         # Stop advancing the grammar once we hit a padding token.
@@ -289,6 +284,22 @@ class StructuredOutputManager:
                         accepted = grammar.accept_tokens(req_id, [token])
                         assert accepted, (token, req_id, scheduled_spec_decode_tokens)
                         state_advancements += 1
+                    cumulative_index += 1
+                if not (self.vllm_config.model_config.is_diffusion and req_tokens):
+                    # Phase 2: bonus position. For diffusion requests with
+                    # scheduled tokens, there is no bonus token to sample.
+                    # Bonus position reads should_fill_bitmask(request)
+                    # directly; in-loop apply_bitmask may be False due to
+                    # -1 padding (#44006).
+                    self._fill_bitmasks(
+                        (
+                            (
+                                grammar,
+                                cumulative_index,
+                                self.should_fill_bitmask(request),
+                            ),
+                        )
+                    )
                     cumulative_index += 1
                 if state_advancements > 0:
                     grammar.rollback(state_advancements)
